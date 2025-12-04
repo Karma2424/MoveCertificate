@@ -38,7 +38,7 @@ fi
 move_custom_cert() {
     if [ "$(ls -A /data/local/tmp/cert)" ]; then
         cp -f /data/local/tmp/cert/* $MODDIR/certificates
-        cp -f /data/local/tmp/cert/* /data/misc/user/0/cacerts-added/
+        # cp -f /data/local/tmp/cert/* /data/misc/user/0/cacerts-added/
     else
         print_log "The directory '/data/local/tmp/cert' is empty."
     fi
@@ -141,7 +141,7 @@ else
     print_log "start move cert !"
     print_log "current sdk version is $sdk_version_number"
     
-    mount -t tmpfs tmpfs $MODDIR/certificates
+    # mount -t tmpfs tmpfs $MODDIR/certificates
     print_log "mount $MODDIR/certificates status:$?"
     print_log "Backup /apex/com.android.conscrypt/cacerts"
     cp -u /apex/com.android.conscrypt/cacerts/* $MODDIR/certificates
