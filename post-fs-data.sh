@@ -5,6 +5,8 @@
 # This will make sure your module will still work
 # if Magisk change its mount point in the future
 MODDIR=${0%/*}
+PATH=/data/adb/ap/bin:/data/adb/ksu/bin:/data/adb/magisk:$PATH
+SUSFS_BIN="/data/adb/ksu/bin/ksu_susfs"
 
 # This script will be executed in post-fs-data mode
 # Android 14 cannot be earlier than Zygote
@@ -23,6 +25,15 @@ echo "[$LOG_TAG] Keep only one up-to-date log" >$LOG_PATH
 print_log() {
     echo "[$LOG_TAG] $@" >>$LOG_PATH
 }
+
+# ksu+susfs operating_mode
+# handle probing for susfs 1.5.3+
+susfs_found=false
+if [ "$KSU" = true ] && [ -f ${SUSFS_BIN} ] &&
+	${SUSFS_BIN} show enabled_features | grep -q "CONFIG_KSU_SUSFS_TRY_UMOUNT" >/dev/null 2>&1; then
+	print_log "susfs with try_umount found!"
+	susfs_found=true
+fi
 
 move_custom_cert() {
     if [ "$(ls -A /data/local/tmp/cert)" ]; then
@@ -154,6 +165,15 @@ else
             nsenter --mount=/proc/${pid}/ns/mnt -- mount --bind $MODDIR/certificates /apex/com.android.conscrypt/cacerts
             nsenter --mount=/proc/${pid}/ns/mnt -- mount --bind $MODDIR/certificates $apex_dir/cacerts
     done
+    
+    if [ "$susfs_found" = true ]; then
+        ${SUSFS_BIN} add_try_umount "/apex/com.android.conscrypt/cacerts" 1
+        ${SUSFS_BIN} add_try_umount "$apex_dir/cacerts" 1
+        print_log "mode ksu_susfs_bind"
+    else
+        print_log "mode normal"
+    fi
+    
     print_log "mount bind $MODDIR/certificates $apex_dir/cacerts status:$?"
     print_log "certificates installed"
 fi
