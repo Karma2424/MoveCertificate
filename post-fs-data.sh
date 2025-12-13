@@ -25,8 +25,8 @@ print_log() {
 susfs_found=false
 if [ "$KSU" = true ] && [ -f ${SUSFS_BIN} ] &&
  ${SUSFS_BIN} show enabled_features | grep -q "CONFIG_KSU_SUSFS_TRY_UMOUNT" >/dev/null 2>&1; then
- print_log "susfs with try_umount found!"
- susfs_found=true
+    print_log "susfs with try_umount found!"
+    susfs_found=true
 fi
 
 print_log "Injecting certificates"
