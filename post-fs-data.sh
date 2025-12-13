@@ -9,12 +9,6 @@ PATH=/data/adb/ap/bin:/data/adb/ksu/bin:/data/adb/magisk:$PATH
 SUSFS_BIN="/data/adb/ksu/bin/ksu_susfs"
 
 # This script will be executed in post-fs-data mode
-# Android 14 cannot be earlier than Zygote
-sdk_version=$(getprop ro.build.version.sdk)
-# debug
-#sdk_version=34
-sdk_version_number=$(expr "$sdk_version" + 0)
-
 # add logcat
 LOG_PATH="$MODDIR/install.log"
 LOG_TAG="iyue"
@@ -30,150 +24,82 @@ print_log() {
 # handle probing for susfs 1.5.3+
 susfs_found=false
 if [ "$KSU" = true ] && [ -f ${SUSFS_BIN} ] &&
-	${SUSFS_BIN} show enabled_features | grep -q "CONFIG_KSU_SUSFS_TRY_UMOUNT" >/dev/null 2>&1; then
-	print_log "susfs with try_umount found!"
-	susfs_found=true
+ ${SUSFS_BIN} show enabled_features | grep -q "CONFIG_KSU_SUSFS_TRY_UMOUNT" >/dev/null 2>&1; then
+ print_log "susfs with try_umount found!"
+ susfs_found=true
 fi
 
-move_custom_cert() {
-    if [ "$(ls -A /data/local/tmp/cert)" ]; then
-        cp -f /data/local/tmp/cert/* $MODDIR/certificates
-        # cp -f /data/local/tmp/cert/* /data/misc/user/0/cacerts-added/
-    else
-        print_log "The directory '/data/local/tmp/cert' is empty."
-    fi
-    print_log "Install /data/local/tmp/cert status:$?"
-}
+print_log "Injecting certificates"
 
-fix_user_permissions() {
-    # "Fix permissions of the system certificate directory"
-    chown -R root:root /data/misc/user/0/cacerts-added/
-    chmod -R 666 /data/misc/user/0/cacerts-added/
-    chown system:system /data/misc/user/0/cacerts-added
-    chmod 755 /data/misc/user/0/cacerts-added
-    print_log "fix user certificate permissions status:$?"
-}
+# Create a separate temp directory, to hold the current certificates
+# Without this, when we add the mount we can't read the current certs anymore.
+mkdir -p $MODDIR/certificates
+chmod 700 $MODDIR/certificates
+rm -rf $MODDIR/certificates/*
 
-fix_system_permissions() {
-    chown root:root /system/etc/security/cacerts
-    chown -R root:root /system/etc/security/cacerts/
-    chmod -R 644 /system/etc/security/cacerts/
-    chmod 755 /system/etc/security/cacerts
-    chcon u:object_r:system_file:s0 /system/etc/security/cacerts/*
-    print_log "fix permissions /system/etc/security/cacerts status:$?"
-}
+# Copy out the existing certificates
+if [ -d "/apex/com.android.conscrypt/cacerts" ]; then
+    cp /apex/com.android.conscrypt/cacerts/* $MODDIR/certificates/
+else
+    cp /system/etc/security/cacerts/* $MODDIR/certificates/
+fi
 
-fix_system_permissions14() {
-    chown -R system:system "$1"
-    chown root:shell "$1"
-    chmod -R 644 "$1"
-    chmod 755 "$1"
-    print_log "fix permissions: $?"
-}
+# Create the in-memory mount on top of the system certs folder
+mount -t tmpfs tmpfs /system/etc/security/cacerts
 
-set_selinux_context(){
-    [ "$(getenforce)" = "Enforcing" ] || return 0
-    default_selinux_context=u:object_r:system_file:s0
-    selinux_context=$(ls -Zd $1 | awk '{print $1}')
+# Copy our new cert in, so we trust that too
+cp -f /data/local/tmp/cert/* $MODDIR/certificates/
 
-    if [ -n "$selinux_context" ] && [ "$selinux_context" != "?" ]; then
-        chcon -R $selinux_context $2
-    else
-        chcon -R $default_selinux_context $2
-    fi
-}
+# Copy the existing certs back into the tmpfs mount, so we keep trusting them
+mv $MODDIR/certificates/* /system/etc/security/cacerts/
 
-compatible(){
-    # compatible adguard or other
-    # Hash 47ec1af8 is for "AdGuard Intermediate CA" intermediate.
-    print_log "Compatible adguard"
-    cert_dir="$MODDIR/certificates"
-    print_log "Running compatibility cleanup for potentially conflicting certificates."
+# Update the perms & selinux context labels, so everything is as readable as before
+chown root:root /system/etc/security/cacerts/*
+chmod 644 /system/etc/security/cacerts/*
 
-    # Remove by filename pattern (hash: 47ec1af8.*)
-    rm -f "$cert_dir"/47ec1af8.*
-    print_log "Removed files matching '47ec1af8.*'."
+chcon u:object_r:system_file:s0 /system/etc/security/cacerts/
+chcon u:object_r:system_file:s0 /system/etc/security/cacerts/*
 
-    # Remove by content string "Guard Personal Intermediate"
-    for cert_file in "$cert_dir"/*; do
-        # Ensure it is a file before trying to read it
-        if [ -f "$cert_file" ]; then
-            # Use grep -q for a silent, efficient check
-            if grep -q "Guard Personal Intermediate" "$cert_file"; then
-                print_log "Removing file containing 'Guard Personal Intermediate': $(basename "$cert_file")"
-                rm -f "$cert_file"
-            fi
+print_log 'System cacerts setup completed'
+
+# Deal with the APEX overrides in Android 14+, which need injecting into each namespace:
+if [ -d "/apex/com.android.conscrypt/cacerts" ]; then
+    print_log 'Injecting certificates into APEX cacerts'
+
+    # When the APEX manages cacerts, we need to mount them at that path too. We can't do
+    # this globally as APEX mounts are namespaced per process, so we need to inject a
+    # bind mount for this directory into every mount namespace.
+
+    # First we mount for the shell itself, for completeness and so we can see this
+    # when we check for correct installation on later runs
+    mount --bind /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts
+
+    # First we get the Zygote process(es), which launch each app
+    ZYGOTE_PID=$(pidof zygote || true)
+    ZYGOTE64_PID=$(pidof zygote64 || true)
+    Z_PIDS="$ZYGOTE_PID $ZYGOTE64_PID"
+    # N.b. some devices appear to have both, some have >1 of each (!)
+
+    # Apps inherit the Zygote's mounts at startup, so we inject here to ensure all newly
+    # started apps will see these certs straight away:
+    for Z_PID in $Z_PIDS; do
+        if [ -n "$Z_PID" ]; then
+            nsenter --mount=/proc/$Z_PID/ns/mnt -- \
+                /bin/mount --bind /system/etc/security/cacerts /apex/com.android.conscrypt/cacerts
         fi
     done
-    print_log "Compatibility cleanup status:$?"
-}
 
-# Android version <= 13 execute
-if [ "$sdk_version_number" -le 33 ]; then
-    print_log "start move cert !"
-    print_log "current sdk version is $sdk_version_number"
-    print_log "Backup /system/etc/security/cacerts"
-    cp -u /system/etc/security/cacerts/* $MODDIR/certificates
-    print_log "Backup /data/misc/user/0/cacerts-added"
-    cp -u /data/misc/user/0/cacerts-added/* $MODDIR/certificates/
-    # Android 13 or lower versions perform
-    move_custom_cert
-    fix_user_permissions
-    compatible
-
-    selinux_context=$(ls -Zd /system/etc/security/cacerts | awk '{print $1}')
-    mount -t tmpfs tmpfs /system/etc/security/cacerts
-    print_log "mount /system/etc/security/cacerts status:$?"
-    
-    cp -f $MODDIR/certificates/* /system/etc/security/cacerts
-    print_log "Install /system/etc/security/cacerts status:$?"
-    fix_system_permissions
-    print_log "certificates installed"
-    [ "$(getenforce)" = "Enforcing" ] || return 0
-    default_selinux_context=u:object_r:system_file:s0
-    if [ -n "$selinux_context" ] && [ "$selinux_context" != "?" ]; then
-        chcon -R $selinux_context /system/etc/security/cacerts
-    else
-        chcon -R $default_selinux_context /system/etc/security/cacerts
-    fi
-else
-
-    print_log "start move cert !"
-    print_log "current sdk version is $sdk_version_number"
-    
-    # mount -t tmpfs tmpfs $MODDIR/certificates
-    print_log "mount $MODDIR/certificates status:$?"
-    print_log "Backup /apex/com.android.conscrypt/cacerts"
-    cp -u /apex/com.android.conscrypt/cacerts/* $MODDIR/certificates
-    print_log "Backup /data/misc/user/0/cacerts-added"
-    cp -u /data/misc/user/0/cacerts-added/* $MODDIR/certificates
-    move_custom_cert
-    fix_user_permissions
-    fix_system_permissions14 $MODDIR/certificates
-    compatible
-
-    print_log "find system conscrypt directory"
-    apex_dir=$(find /apex -type d -name "com.android.conscrypt@*")
-    print_log "find conscrypt directory: $apex_dir"
-
-    set_selinux_context /apex/com.android.conscrypt/cacerts $MODDIR/certificates
-    # These two directories are mapped to the same block
-    mount -o bind $MODDIR/certificates /apex/com.android.conscrypt/cacerts
-    print_log "mount bind $MODDIR/certificates /apex/com.android.conscrypt/cacerts status:$?"
-    mount -o bind $MODDIR/certificates $apex_dir/cacerts
-    for pid in 1 $(pgrep zygote) $(pgrep zygote64); do
-            nsenter --mount=/proc/${pid}/ns/mnt -- mount --bind $MODDIR/certificates /apex/com.android.conscrypt/cacerts
-            nsenter --mount=/proc/${pid}/ns/mnt -- mount --bind $MODDIR/certificates $apex_dir/cacerts
-    done
-    
-    if [ "$susfs_found" = true ]; then
-        ${SUSFS_BIN} add_try_umount "/apex/com.android.conscrypt/cacerts" 1
-        ${SUSFS_BIN} add_try_umount "$apex_dir/cacerts" 1
-        print_log "mode ksu_susfs_bind"
-    else
-        print_log "mode normal"
-    fi
-    
-    print_log "mount bind $MODDIR/certificates $apex_dir/cacerts status:$?"
-    print_log "certificates installed"
+    print_log 'Zygote APEX certificates remounted'
 fi
+    
+if [ "$susfs_found" = true ]; then
+    ${SUSFS_BIN} add_try_umount "/system/etc/security/cacerts" 1
+    print_log "mode ksu_susfs_bind"
+else
+    print_log "mode normal"
+fi
+
+# Delete the temp cert directory
+rm -r $MODDIR/certificates
+
+print_log "System cert successfully injected"
